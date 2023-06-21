@@ -63,7 +63,7 @@ poetry shell
 To start the program from a poetry shell:
 
 ```bash
-stream run vetter/chat.py
+streamlit run vetter/chat.py
 ```
 
 If it does not automatically open, point your browser to http://localhost:8502/.

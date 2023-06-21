@@ -1,15 +1,16 @@
 """A chat bot that interacts with GPT."""
 
+import logging
 from os import environ
 from sys import stderr
 
 import openai
-from openai.openai_object import OpenAIObject
 import streamlit as st
-from streamlit import session_state as session
+from streamlit import session_state as sess
 from streamlit_chat import message
-from tenacity import (RetryError, retry, stop_after_attempt,
-                      wait_random_exponential)
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from vetter.history import History
 
 MODEL = "gpt-3.5-turbo"
 
@@ -32,8 +33,17 @@ except KeyError:
     exit(1)
 
 
-@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def query(history) -> OpenAIObject:
+def handle_error(state):
+    """Handle errors that happen durring queries."""
+    breakpoint()
+    if "history" in sess:
+        sess.history.errors.append(state.outcome.result())
+    return state.outcome.result()
+
+
+@retry(wait=wait_exponential(min=20, max=60), stop=stop_after_attempt(6),
+       retry_error_callback=handle_error)
+def query():
     """Send a query to GPT, retry and backoff exponentially, and return the
     first item in the "choice" list.
 
@@ -52,74 +62,71 @@ def query(history) -> OpenAIObject:
                 "finish_reason": "stop"
             }
     """
-    response = openai.ChatCompletion.create(model=MODEL, messages=history)
-    return response["choices"][0]
+    logging.info(
+        f"============> [query()] "
+        f"processed: {sess.history.processed}, "
+        f"count: {sess.history.count}, "
+        f"last: {sess.history.last}, "
+        f"should?: {sess.history.should_query}"
+    )
 
+    if not sess.history.should_query:
+        return
 
-def user_input() -> str:
-    """Place a text box widget on the page and return the user submitted
-    content."""
-    return st.text_area("", key="input")
+    logging.info("============> [query()] Trying...")
+
+    response = openai.ChatCompletion.create(
+        model=MODEL,
+        messages=sess.history.messages
+    )
+    result = response["choices"][0]
+
+    if result["finish_reason"] == "max_tokens":
+        sess.history.errors.append("Max tokens reached.")
+        logging.error("Max tokens reached.")
+        st.error("Max tokens reached.")
+        return
+
+    sess.history.add("assistant", result["message"]["content"])
+    sess.history.processed = sess.history.count
+    logging.info(f"~~~~~~~~~> SUCCESS processed: {sess.processed}")
 
 
 def loop():
     """The page loop which is rerun on user-interaction with any widget."""
     # initialize processed value in session to track the messages that have
     # already been submitted to GPT and received a response
-    if "processed" not in session:
-        session["processed"] = 0
+    logging.info(f"LOOP session keys: {list(sess.keys())}")
+    if "history" not in sess:
+        sess["history"] = History()
 
-    # initialize message history
-    if "messages" not in session:
-        session["messages"] = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Knock knock."},
-            {"role": "assistant", "content": "Who's there?"},
-            {"role": "user", "content": "Orange."},
-        ]
+    if not sess.history.processed:
+        query()
 
     st.set_page_config(
         page_title="Candidate Vetter",
         page_icon=":robot:"
     )
+
     st.header("Candidate Vetter")
 
-    # only attempt to query GPT if there are messages that have not been
-    # processed
-    if session.processed < len(session["messages"]):
-        try:
-            # query GPT
-            result = query(session.messages)
-
-        # give up retries
-        except RetryError:
-            st.error("Rate limit reached.")
-            st.stop()
-            return
-
-        else:
-            # handle max token errors
-            if result["finish_reason"] == "max_tokens":
-                st.error("Max tokens reached.")
-                st.stop()
-                return
-
-            # a successful result is appended to the session messages and
-            # counted as processed
-            session.messages.append(
-                {"role": "assistant", "content": result["message"]["content"]}
-            )
-            session.processed = len(session["messages"]) + 1
+    logging.info(
+        f"processed: {sess.history.processed}, "
+        f"count: {sess.history.count}, "
+        f"messages: {len(sess.history.messages)}, "
+        f"last: {sess.history.last}"
+    )
 
     # get input from user
-    text = user_input()
+    text = st.text_input("", key="input")
 
+    # add to history and process response
     if text:
-        # append to message (but do NOT mark as processed)
-        session.messages.append({"role": "user", "content": text})
+        sess.history.add("user", text)
+        query()
 
     # print the message history
-    for i, msg in enumerate(session.messages):
+    for i, msg in enumerate(sess.history.messages):
         if msg["role"] == "system":
             continue
 
